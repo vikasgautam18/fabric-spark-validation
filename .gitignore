@@ -1,0 +1,56 @@
+# Local-only / scratch
+optimizer/
+.cache/
+tmp/
+scratch/
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets & env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs & test output
+*.log
+logs/
+test-results/
+htmlcov/
+.coverage
+coverage.xml
+
+# Spark / Hadoop local artifacts
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Azure / Fabric local state
+.azure/
+.fabric/
+*.tfstate
+*.tfstate.backup
+.terraform/

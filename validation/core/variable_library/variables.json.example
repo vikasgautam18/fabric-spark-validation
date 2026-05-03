@@ -1,0 +1,17 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/variableLibrary/definition/variables/1.0.0/schema.json",
+  "variables": [
+    {"name": "pg_host",          "type": "String",  "value": "<your-pg-host>.privatelinkservice"},
+    {"name": "pg_port",          "type": "Integer", "value": 5432},
+    {"name": "pg_database",      "type": "String",  "value": "<pg_database_name>"},
+    {"name": "pg_user",          "type": "String",  "value": "<pg_admin_user>"},
+    {"name": "pg_schema",        "type": "String",  "value": "<source_schema>"},
+    {"name": "kv_url",           "type": "String",  "value": "https://<your-keyvault-name>.vault.azure.net/"},
+    {"name": "kv_pg_secret",     "type": "String",  "value": "pg-password"},
+    {"name": "lakehouse_name",   "type": "String",  "value": "<your_lakehouse_name>"},
+    {"name": "lakehouse_schema", "type": "String",  "value": "silver"},
+    {"name": "sql_server",       "type": "String",  "value": "<server-id>.database.fabric.microsoft.com"},
+    {"name": "sql_database",     "type": "String",  "value": "<sql_db_name_with_id_suffix>"},
+    {"name": "sql_schema",       "type": "String",  "value": "dbo"}
+  ]
+}
