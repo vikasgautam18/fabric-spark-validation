@@ -9,7 +9,7 @@ Prints the pipeline ID to stdout.
 """
 import sys, json, base64, subprocess, time, urllib.request, urllib.error
 
-WORKSPACE_ID = "5597b17a-edef-4fd7-bcc4-3dbd5b139576"
+WORKSPACE_ID = "<your workspace id here>"
 FABRIC_AUD   = "https://api.fabric.microsoft.com"
 
 
