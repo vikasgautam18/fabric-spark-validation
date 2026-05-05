@@ -83,9 +83,13 @@ MAX_DETAIL_ROWS = 1000
 ALLOW_FILTER_EXPRESSIONS = True
 
 # Per-table semantic statuses written to validation_results_history (SQL DB):
-#   pass / count_mismatch / hash_mismatch / schema_drift / error
+#   pass / inconclusive / count_mismatch / hash_mismatch / schema_drift / error
 # A run that has ANY of these failing statuses raises after persisting audit.
-FAILING_STATUSES = ("count_mismatch", "hash_mismatch", "schema_drift", "error")
+# `inconclusive` is reserved for PK-less / fingerprint comparisons that detect
+# divergence at the multiset level but cannot point at offending rows. No engine
+# code path emits it as of Phase 1; it is wired here so later phases (fingerprint
+# mode and PK-less hash/advanced) can adopt it without further plumbing changes.
+FAILING_STATUSES = ("inconclusive", "count_mismatch", "hash_mismatch", "schema_drift", "error")
 
 # Ensure consistent timestamp handling (Finding #4: TIMESTAMPTZ)
 spark.conf.set("spark.sql.session.timeZone", "UTC")
@@ -116,13 +120,15 @@ print(f"Run ID: {RUN_ID}\n")
 def _classify_status(result):
     """Map engine result dict to a specific audit status string.
 
-    Returns one of: pass / count_mismatch / hash_mismatch / error
+    Returns one of: pass / inconclusive / count_mismatch / hash_mismatch / error
     Schema-drift is detected at the exception layer (raises ValueError),
     not here — `_classify_exception` handles that path.
     """
     s = result.get("status")
     if s == "PASS":
         return "pass"
+    if s == "INCONCLUSIVE":
+        return "inconclusive"
     if s in ("ERROR", "DATA_QUALITY_ERROR"):
         return "error"
     # FAIL — disambiguate by what mismatched
@@ -390,7 +396,14 @@ def resolve_columns(lh_df, pg_df, skip_cols, schema_drift_policy):
 
 
 def check_pk_quality(df, pk_cols, source_name):
-    """Validate PK columns exist, have no nulls, and are unique."""
+    """Validate PK columns exist, have no nulls, and are unique.
+
+    Returns [] when pk_cols is empty — callers MUST decide separately whether
+    an empty PK list is acceptable for the chosen comparison mode. Without
+    this guard `df.filter(None)` further down would raise TypeError.
+    """
+    if not pk_cols:
+        return []
     issues = []
     df_cols = set(df.columns)
 
@@ -556,6 +569,24 @@ def run_hash(config, window_start, window_end):
     pk_cols = [kc["column_name"] for kc in sorted(key_cols_raw, key=lambda x: x["ordinal"])]
     skip_cols = config["skip_cols"] if config["skip_cols"] else []
 
+    # Empty key_cols guard — fail fast before any JDBC pull. Hash mode joins on
+    # the PK and would crash later (e.g. df.filter(None), pk_cols[0] IndexError).
+    # Phase 5 will introduce pk_fallback_strategy='no_pk_hash' for auto-routing.
+    if not pk_cols:
+        return {
+            "lakehouse_count": None, "postgres_count": None, "count_match": None,
+            "rows_only_in_lakehouse": None, "rows_only_in_postgres": None,
+            "rows_with_mismatches": None,
+            "status": "DATA_QUALITY_ERROR",
+            "error_message": (
+                f"comparison_mode='hash' requires entries in "
+                f"validation.comparison_key_columns for table '{table_name}'. "
+                f"Either populate the PK columns, switch comparison_mode to "
+                f"'basic' or 'fingerprint', or set "
+                f"pk_fallback_strategy='no_pk_hash' (Phase 5)."
+            ),
+        }, []
+
     # Read both datasets
     pg_df = read_postgres(pg_schema, pg_table, filter_col_pg, window_start, window_end)
     lh_df = read_lakehouse(lh_schema, table_name, filter_col, window_start, window_end)
@@ -657,6 +688,24 @@ def run_advanced(config, window_start, window_end):
     key_cols_raw = config["key_cols"]
     pk_cols = [kc["column_name"] for kc in sorted(key_cols_raw, key=lambda x: x["ordinal"])]
     skip_cols = config["skip_cols"] if config["skip_cols"] else []
+
+    # Empty key_cols guard — see run_hash() for the same pattern. Advanced mode
+    # joins on the PK and produces per-row diff details, neither of which is
+    # meaningful without a PK.
+    if not pk_cols:
+        return {
+            "lakehouse_count": None, "postgres_count": None, "count_match": None,
+            "rows_only_in_lakehouse": None, "rows_only_in_postgres": None,
+            "rows_with_mismatches": None,
+            "status": "DATA_QUALITY_ERROR",
+            "error_message": (
+                f"comparison_mode='advanced' requires entries in "
+                f"validation.comparison_key_columns for table '{table_name}'. "
+                f"Either populate the PK columns, switch comparison_mode to "
+                f"'basic' or 'fingerprint', or set "
+                f"pk_fallback_strategy='no_pk_advanced' (Phase 5)."
+            ),
+        }, []
 
     # Read both datasets
     pg_df = read_postgres(pg_schema, pg_table, filter_col_pg, window_start, window_end)
@@ -1039,7 +1088,8 @@ else:
 
 # Emit RUN_ID so callers (pipelines) can correlate downstream activities
 # (e.g., scenario_assert needs this to look up the per-table result row).
-try:
-    notebookutils.notebook.exit(str(RUN_ID))
-except Exception:
-    pass
+# notebookutils.notebook.exit() works by raising a control-flow exception
+# that Fabric catches and converts into the activity's exitValue. Wrapping
+# it in try/except Exception silently swallows that exception, leaving
+# exitValue unset — do NOT add a broad except here.
+notebookutils.notebook.exit(str(RUN_ID))

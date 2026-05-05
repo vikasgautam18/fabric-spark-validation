@@ -1,0 +1,86 @@
+{
+    "name": "validation_test_suite",
+    "objectId": "00000000-0000-0000-0000-000000000000",
+    "properties": {
+        "activities": [
+            {
+                "name": "ListScenarios",
+                "description": "Read enabled rows from validation.scenarios; emits a JSON array of {scenario_id, target_table}.",
+                "type": "TridentNotebook",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.00:10:00",
+                    "retry": 1,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "notebookId": "__NOTEBOOK_ID__:scenario_list",
+                    "workspaceId": "__WORKSPACE_ID__",
+                    "parameters": {
+                        "scenario_ids_filter": {
+                            "value": {
+                                "value": "@pipeline().parameters.scenario_ids_filter",
+                                "type": "Expression"
+                            },
+                            "type": "string"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "ForEachScenario",
+                "description": "Run each scenario serially. Sequential execution avoids concurrent mutations on the same target_table that would cross-contaminate results.",
+                "type": "ForEach",
+                "dependsOn": [
+                    {
+                        "activity": "ListScenarios",
+                        "dependencyConditions": [ "Succeeded" ]
+                    }
+                ],
+                "typeProperties": {
+                    "isSequential": true,
+                    "items": {
+                        "value": "@json(activity('ListScenarios').output.result.exitValue)",
+                        "type": "Expression"
+                    },
+                    "activities": [
+                        {
+                            "name": "InvokeRunner",
+                            "type": "ExecutePipeline",
+                            "dependsOn": [],
+                            "policy": {
+                                "secureInput": false
+                            },
+                            "typeProperties": {
+                                "pipeline": {
+                                    "referenceName": "__PIPELINE_ID__:validation_scenario_runner",
+                                    "type": "PipelineReference"
+                                },
+                                "waitOnCompletion": true,
+                                "parameters": {
+                                    "scenario_id": {
+                                        "value": "@item().scenario_id",
+                                        "type": "Expression"
+                                    },
+                                    "target_table": {
+                                        "value": "@item().target_table",
+                                        "type": "Expression"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "parameters": {
+            "scenario_ids_filter": {
+                "type": "string",
+                "defaultValue": ""
+            }
+        },
+        "annotations": [ "validation", "scenario-suite" ]
+    }
+}

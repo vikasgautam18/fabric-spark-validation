@@ -84,6 +84,38 @@ def write_verdict(verdict, actual_status, evidence_ok, notes):
 
 # In[5]:
 
+# ── Always-on teardown: restore validation.comparison_key_columns ────────────
+# Runs BEFORE any short-circuit so a crashed engine, missing run_id, or
+# seeder='not_applicable' can never leave the metadata in a broken state.
+# The backup table is created lazily by the seeder; absent table = no-op.
+
+if mutation_type == "clear_key_cols":
+    try:
+        if spark.catalog.tableExists("validation.comparison_key_columns_test_backup"):
+            restored = spark.sql(f"""
+                SELECT COUNT(*) AS n FROM validation.comparison_key_columns_test_backup
+                WHERE scenario_id = '{scenario_id}' AND table_name = '{target_table}'
+            """).collect()[0]["n"]
+            if restored:
+                spark.sql(f"""
+                    INSERT INTO validation.comparison_key_columns
+                    SELECT table_name, column_name, ordinal
+                    FROM validation.comparison_key_columns_test_backup
+                    WHERE scenario_id = '{scenario_id}' AND table_name = '{target_table}'
+                """)
+                spark.sql(f"""
+                    DELETE FROM validation.comparison_key_columns_test_backup
+                    WHERE scenario_id = '{scenario_id}' AND table_name = '{target_table}'
+                """)
+                print(f"  ♻️  restored {restored} key_column row(s) for {target_table}")
+    except Exception as restore_exc:
+        # Surface restore failures into the print log; verdict will record below
+        # via evidence_notes if we reach the evidence-checks block.
+        print(f"  ⚠️  key_columns restore FAILED: {restore_exc}")
+
+
+# In[6]:
+
 # ── Short-circuit: not_applicable from seeder ────────────────────────────────
 
 _VERDICT_PRESET = None  # if set, skip downstream eval and exit at end with this value
@@ -279,6 +311,18 @@ elif mutation_type == "drop_column":
 elif mutation_type == "null_out_pk":
     if "null" not in err.lower() and "pk" not in err.lower():
         evidence_notes.append("error_message does not mention null PK")
+
+elif mutation_type == "clear_key_cols":
+    # Substring match on engine error message. Configured per-scenario via
+    # mutation_params.expected_error_substring so we don't have to extend the
+    # scenarios table schema.
+    needle = mutation_params.get("expected_error_substring", "")
+    if needle and needle not in err:
+        evidence_ok = False
+        evidence_notes.append(
+            f"error_message does not contain expected substring "
+            f"'{needle}' (got: {err[:200]!r})"
+        )
 
 
 # In[8]:

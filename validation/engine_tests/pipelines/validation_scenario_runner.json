@@ -1,0 +1,204 @@
+{
+    "name": "validation_scenario_runner",
+    "objectId": "00000000-0000-0000-0000-000000000000",
+    "properties": {
+        "activities": [
+            {
+                "name": "RestoreBaseline",
+                "description": "Re-import target table from PostgreSQL so the lakehouse copy starts from a clean baseline before the seeder mutates it.",
+                "type": "TridentNotebook",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.00:30:00",
+                    "retry": 1,
+                    "retryIntervalInSeconds": 60,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "notebookId": "__NOTEBOOK_ID__:getDataFromPostgres",
+                    "workspaceId": "__WORKSPACE_ID__",
+                    "parameters": {
+                        "pg_tables": {
+                            "value": {
+                                "value": "@pipeline().parameters.target_table",
+                                "type": "Expression"
+                            },
+                            "type": "string"
+                        },
+                        "write_mode": {
+                            "value": "overwrite",
+                            "type": "string"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "RunSeeder",
+                "description": "Apply the scenario's mutation to the lakehouse silver table.",
+                "type": "TridentNotebook",
+                "dependsOn": [
+                    {
+                        "activity": "RestoreBaseline",
+                        "dependencyConditions": [ "Succeeded" ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.00:15:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 60,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "typeProperties": {
+                    "notebookId": "__NOTEBOOK_ID__:scenario_seeder",
+                    "workspaceId": "__WORKSPACE_ID__",
+                    "parameters": {
+                        "scenario_id": {
+                            "value": {
+                                "value": "@pipeline().parameters.scenario_id",
+                                "type": "Expression"
+                            },
+                            "type": "string"
+                        },
+                        "pipeline_run_id": {
+                            "value": {
+                                "value": "@pipeline().RunId",
+                                "type": "Expression"
+                            },
+                            "type": "string"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "RunIfApplicable",
+                "description": "Skip RunEngine + RunAssert when the seeder reported the scenario as not_applicable (mode/policy mismatch). The seeder writes its own verdict row in that case, so the audit trail is preserved.",
+                "type": "IfCondition",
+                "dependsOn": [
+                    {
+                        "activity": "RunSeeder",
+                        "dependencyConditions": [ "Succeeded" ]
+                    }
+                ],
+                "typeProperties": {
+                    "expression": {
+                        "value": "@not(equals(activity('RunSeeder').output.result.exitValue, 'not_applicable'))",
+                        "type": "Expression"
+                    },
+                    "ifTrueActivities": [
+                        {
+                            "name": "RunEngine",
+                            "description": "Run comparison_engine narrowed to the target table; emit the engine RUN_ID via notebook.exit so the downstream assert can read it.",
+                            "type": "TridentNotebook",
+                            "dependsOn": [],
+                            "policy": {
+                                "timeout": "0.01:00:00",
+                                "retry": 0,
+                                "retryIntervalInSeconds": 60,
+                                "secureOutput": false,
+                                "secureInput": false
+                            },
+                            "typeProperties": {
+                                "notebookId": "__NOTEBOOK_ID__:comparison_engine",
+                                "workspaceId": "__WORKSPACE_ID__",
+                                "parameters": {
+                                    "triggered_by": {
+                                        "value": "scenario_test",
+                                        "type": "string"
+                                    },
+                                    "scenario_id": {
+                                        "value": {
+                                            "value": "@pipeline().parameters.scenario_id",
+                                            "type": "Expression"
+                                        },
+                                        "type": "string"
+                                    },
+                                    "tables_filter": {
+                                        "value": {
+                                            "value": "@concat('[\"', pipeline().parameters.target_table, '\"]')",
+                                            "type": "Expression"
+                                        },
+                                        "type": "string"
+                                    },
+                                    "fail_on_validation_failure": {
+                                        "value": "false",
+                                        "type": "string"
+                                    },
+                                    "pipeline_run_id": {
+                                        "value": {
+                                            "value": "@pipeline().RunId",
+                                            "type": "Expression"
+                                        },
+                                        "type": "string"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "name": "RunAssert",
+                            "description": "Read the engine result + samples and write the scenario verdict.",
+                            "type": "TridentNotebook",
+                            "dependsOn": [
+                                {
+                                    "activity": "RunEngine",
+                                    "dependencyConditions": [ "Succeeded", "Failed" ]
+                                }
+                            ],
+                            "policy": {
+                                "timeout": "0.00:15:00",
+                                "retry": 0,
+                                "retryIntervalInSeconds": 60,
+                                "secureOutput": false,
+                                "secureInput": false
+                            },
+                            "typeProperties": {
+                                "notebookId": "__NOTEBOOK_ID__:scenario_assert",
+                                "workspaceId": "__WORKSPACE_ID__",
+                                "parameters": {
+                                    "scenario_id": {
+                                        "value": {
+                                            "value": "@pipeline().parameters.scenario_id",
+                                            "type": "Expression"
+                                        },
+                                        "type": "string"
+                                    },
+                                    "run_id": {
+                                        "value": {
+                                            "value": "@activity('RunEngine').output.result.exitValue",
+                                            "type": "Expression"
+                                        },
+                                        "type": "string"
+                                    },
+                                    "seeder_status": {
+                                        "value": {
+                                            "value": "@activity('RunSeeder').output.result.exitValue",
+                                            "type": "Expression"
+                                        },
+                                        "type": "string"
+                                    },
+                                    "pipeline_run_id": {
+                                        "value": {
+                                            "value": "@pipeline().RunId",
+                                            "type": "Expression"
+                                        },
+                                        "type": "string"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "parameters": {
+            "scenario_id": {
+                "type": "string"
+            },
+            "target_table": {
+                "type": "string"
+            }
+        },
+        "annotations": [ "validation", "scenario-test" ]
+    }
+}

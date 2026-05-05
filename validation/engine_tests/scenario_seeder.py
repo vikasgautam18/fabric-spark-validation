@@ -25,7 +25,10 @@
 # ── Parameters (set from pipeline) ───────────────────────────────────────────
 
 # This cell must have the `parameters` tag.
-scenario_id = "baseline-appointments"   # required — overridden by pipeline
+scenario_id     = "baseline-appointments"   # required — overridden by pipeline
+pipeline_run_id = None                      # optional — set by pipeline so the
+                                            # not_applicable verdict row links
+                                            # back to the pipeline run.
 
 
 # In[3]:
@@ -294,6 +297,48 @@ def mutation_null_out_pk():
     print(f"  ✅ nulled {pks[0]} on {len(victim_rows)} row(s)")
 
 
+# Per-scenario backup table for clear_key_cols. The asserter MUST restore from
+# this table after reading the audit row, otherwise the next pipeline run finds
+# the metadata still missing and every subsequent comparison for the table fails.
+_PK_BACKUP_TABLE = "validation.comparison_key_columns_test_backup"
+
+
+def mutation_clear_key_cols():
+    """Snapshot then delete validation.comparison_key_columns rows for the target.
+
+    Used by no-PK safety-guard regression scenarios. The asserter reads back
+    from `_PK_BACKUP_TABLE` keyed on (scenario_id, table_name) and restores.
+    """
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {_PK_BACKUP_TABLE} (
+            scenario_id  STRING,
+            table_name   STRING,
+            column_name  STRING,
+            ordinal      INT,
+            backed_up_at TIMESTAMP
+        ) USING DELTA
+    """)
+    # Idempotent: clear any prior backup for this (scenario, table) pair before snapshotting.
+    spark.sql(
+        f"DELETE FROM {_PK_BACKUP_TABLE} "
+        f"WHERE scenario_id = '{scenario_id}' AND table_name = '{target_table}'"
+    )
+    snap = spark.sql(
+        f"SELECT '{scenario_id}' AS scenario_id, table_name, column_name, ordinal, "
+        f"       current_timestamp() AS backed_up_at "
+        f"FROM validation.comparison_key_columns WHERE table_name = '{target_table}'"
+    )
+    snap_count = snap.count()
+    if snap_count == 0:
+        raise RuntimeError(
+            f"clear_key_cols: target_table '{target_table}' has no key_columns to clear "
+            f"— scenario assumes pre-existing PKs"
+        )
+    snap.write.format("delta").mode("append").saveAsTable(_PK_BACKUP_TABLE)
+    spark.sql(f"DELETE FROM validation.comparison_key_columns WHERE table_name = '{target_table}'")
+    print(f"  ✅ backed up {snap_count} key_column row(s) to {_PK_BACKUP_TABLE} and cleared metadata")
+
+
 _DISPATCH = {
     "noop": mutation_noop,
     "delete_rows": mutation_delete_rows,
@@ -302,6 +347,7 @@ _DISPATCH = {
     "add_extra_column": mutation_add_extra_column,
     "drop_column": mutation_drop_column,
     "null_out_pk": mutation_null_out_pk,
+    "clear_key_cols": mutation_clear_key_cols,
 }
 
 if mutation_type not in _DISPATCH:
@@ -309,6 +355,29 @@ if mutation_type not in _DISPATCH:
 
 if not _SHOULD_RUN:
     print(f"\n⏭️  scenario_seeder skipped — {scenario_id} ({_SKIP_REASON})")
+    # Write the not_applicable verdict directly so the audit trail in
+    # validation_scenario_runs is preserved even when the pipeline's
+    # IfCondition skips RunEngine + RunAssert downstream.
+    try:
+        run_tsql_params(
+            "INSERT INTO [dbo].[validation_scenario_runs] "
+            "(scenario_run_id, scenario_id, target_table, mutation_type, "
+            " engine_run_id, expected_status, actual_status, evidence_ok, "
+            " verdict, notes, pipeline_run_id, created_at) "
+            "VALUES (NEWID(), ?, ?, ?, NULL, ?, NULL, NULL, "
+            "        'not_applicable', ?, ?, ?)",
+            [
+                scenario_id, target_table, mutation_type,
+                expected_status,
+                f"Seeder reported not_applicable: {_SKIP_REASON}",
+                pipeline_run_id, datetime.utcnow(),
+            ],
+        )
+        print(f"  → verdict=not_applicable written to validation_scenario_runs")
+    except Exception as verdict_exc:
+        # Don't let an audit-write failure mask the actual skip — log loudly
+        # and still exit cleanly so the pipeline's IfCondition fires.
+        print(f"  ⚠️  failed to write not_applicable verdict: {verdict_exc}")
     _exit_value = "not_applicable"
 else:
     _DISPATCH[mutation_type]()

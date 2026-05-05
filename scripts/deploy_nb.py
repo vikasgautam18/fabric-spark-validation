@@ -4,15 +4,19 @@
 Usage:
     deploy_nb.py <local.py> <displayName> <folderId> [<existingNotebookId>]
 
+If <existingNotebookId> is omitted, the script auto-detects an existing
+notebook with the same displayName in the target workspace + folder
+and updates it; if none is found, a new notebook is created.
+
 Cell separator in .py:  lines beginning with "# In[N]:" mark cell starts.
 Magic-only cells (lines like "%run something") are written as-is into the
 ipynb cell source so Fabric's magic dispatcher picks them up.
 """
 import sys, json, base64, re, subprocess, time, urllib.request, urllib.error
 
-WORKSPACE_ID  = "<your workspace id here>"
-LH_ID         = "<your lakehouse id here>"
-LH_NAME       = "<your lakehouse name here>"
+WORKSPACE_ID  = "e692fb91-ab30-4b11-a11a-22da087d11d7"
+LH_ID         = "5ab25b21-a8a5-4c8b-8237-290290db6dd9"
+LH_NAME       = "lhdemo"
 FABRIC_AUD    = "https://api.fabric.microsoft.com"
 
 
@@ -84,6 +88,44 @@ def poll_lro(loc, headers):
     return "TimedOut", None
 
 
+def find_notebook(name, folder, headers):
+    """Return notebook id whose displayName matches name. Prefer an exact
+    folderId match if one is in the same folder as `folder`; otherwise fall
+    back to a name-only match across the workspace and warn loudly. Returns
+    None when no notebook with that displayName exists at all."""
+    url = f"{FABRIC_AUD}/v1/workspaces/{WORKSPACE_ID}/notebooks"
+    name_matches = []
+    while url:
+        s, _, b = http("GET", url, headers)
+        if s != 200:
+            print(f"⚠️  could not list notebooks for auto-detect (HTTP {s}); "
+                  f"will create new")
+            return None
+        body = json.loads(b)
+        for it in body.get("value", []):
+            if it.get("displayName") == name:
+                name_matches.append(it)
+        url = body.get("continuationUri")
+
+    if not name_matches:
+        return None
+
+    # Prefer the entry in the requested folder if any.
+    for it in name_matches:
+        if folder and it.get("folderId") == folder:
+            return it["id"]
+
+    # Fall back to the first name match. Display names are unique within a
+    # workspace, so there's at most one; warn so the operator knows the
+    # update is happening in a different folder than the one they passed.
+    pick = name_matches[0]
+    if folder and pick.get("folderId") != folder:
+        print(f"⚠️  notebook '{name}' lives in folderId={pick.get('folderId')!r}, "
+              f"not the requested {folder!r}. Updating in place; pass an explicit "
+              f"GUID as 4th arg if you'd rather create a new copy.")
+    return pick["id"]
+
+
 def main():
     if len(sys.argv) < 4:
         print(__doc__); sys.exit(1)
@@ -97,6 +139,11 @@ def main():
 
     token = get_token()
     H = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    if not nb_id:
+        nb_id = find_notebook(name, folder, H)
+        if nb_id:
+            print(f"  auto-detected existing notebook → {nb_id}")
 
     if nb_id:
         url = f"{FABRIC_AUD}/v1/workspaces/{WORKSPACE_ID}/notebooks/{nb_id}/updateDefinition"

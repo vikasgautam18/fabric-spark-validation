@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS validation.scenarios (
     scenario_id            STRING  COMMENT 'Unique scenario identifier (kebab-case)',
     description            STRING  COMMENT 'Human-readable scenario description',
     target_table           STRING  COMMENT 'Single table_name from comparison_config to test',
-    mutation_type          STRING  COMMENT 'noop | delete_rows | insert_extra_rows | update_column | add_extra_column | drop_column | null_out_pk',
+    mutation_type          STRING  COMMENT 'noop | delete_rows | insert_extra_rows | update_column | add_extra_column | drop_column | null_out_pk | clear_key_cols',
     mutation_params        STRING  COMMENT 'JSON params for the mutation (e.g. {"count": 50, "column": "notes"})',
     expected_status        STRING  COMMENT 'pass | count_mismatch | hash_mismatch | schema_drift | error',
     valid_comparison_modes STRING  COMMENT 'Comma-separated list: basic,hash,advanced. Scenarios skipped (not_applicable) if active mode not listed',
@@ -132,6 +132,35 @@ SCENARIOS = [
         mutation_params='{"column_name": "scenario_extra"}',
         expected_status="schema_drift",
         valid_comparison_modes="hash,advanced",
+        enabled=True,
+        created_at=NOW,
+    ),
+
+    # ── No-PK safety guards (Phase 1 of feature/no-pk) ──────────────────────
+    # Clears all rows from validation.comparison_key_columns for the target
+    # table BEFORE the engine runs, then restores them in the asserter. The
+    # engine must convert the resulting empty pk_cols into a structured
+    # DATA_QUALITY_ERROR (audit status 'error') instead of crashing with a
+    # TypeError or IndexError.
+    Row(
+        scenario_id="pk-less-misconfig-appointments-hash",
+        description="Empty key_cols + comparison_mode='hash' → audit 'error' with actionable message (no crash)",
+        target_table="appointments",
+        mutation_type="clear_key_cols",
+        mutation_params='{"expected_error_substring": "requires entries in validation.comparison_key_columns"}',
+        expected_status="error",
+        valid_comparison_modes="hash",
+        enabled=True,
+        created_at=NOW,
+    ),
+    Row(
+        scenario_id="pk-less-misconfig-appointments-advanced",
+        description="Empty key_cols + comparison_mode='advanced' → audit 'error' with actionable message (no crash)",
+        target_table="appointments",
+        mutation_type="clear_key_cols",
+        mutation_params='{"expected_error_substring": "requires entries in validation.comparison_key_columns"}',
+        expected_status="error",
+        valid_comparison_modes="advanced",
         enabled=True,
         created_at=NOW,
     ),
