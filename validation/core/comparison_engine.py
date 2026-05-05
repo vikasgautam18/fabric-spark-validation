@@ -7,9 +7,15 @@
 # configuration from `validation.comparison_config`.
 #
 # Modes:
-#   - **basic**:    Row count comparison only
-#   - **hash**:     Row count + per-row hash digest comparison
-#   - **advanced**: Full row-by-row, column-by-column diff
+#   - **basic**:           Row count comparison only
+#   - **hash**:            Row count + per-row hash digest comparison (requires PK)
+#   - **hash_no_pk**:      Multiset count diff over row hashes (no PK required)
+#   - **advanced**:        Full row-by-row, column-by-column diff (requires PK)
+#   - **advanced_no_pk**:  Bidirectional exceptAll over normalized rows (no PK required)
+#
+# Auto-routing: when a table configured as `hash` or `advanced` has no entries
+# in `comparison_key_columns`, the engine consults `pk_fallback_strategy` and
+# can transparently route to `hash_no_pk` / `advanced_no_pk` (Phase 5).
 #
 # Prerequisites:
 #   1. Run `comparison_setup` notebook first to create metadata tables
@@ -101,6 +107,8 @@ print(f"  Mode caveats:")
 print(f"    hash, hash_no_pk : exact equality (numeric_tolerance NOT applied;")
 print(f"                       float→round(8); JSON/JSONB compared as text)")
 print(f"    advanced         : numeric_tolerance applied per row")
+print(f"    advanced_no_pk   : numeric_tolerance applied via row-rounding (approximate;")
+print(f"                       JSON/JSONB compared as text; timestamps at second precision)")
 print(f"  triggered_by={triggered_by} scenario_id={scenario_id} pipeline_run_id={pipeline_run_id}")
 
 
@@ -111,6 +119,7 @@ from datetime import datetime, timedelta
 from pyspark.sql import functions as F
 from pyspark.sql.types import *
 import json
+import math
 import time
 import traceback
 import uuid
@@ -902,6 +911,194 @@ def run_hash_no_pk(config, window_start, window_end):
         pg_hashed.unpersist()
 
 
+def run_advanced_no_pk(config, window_start, window_end):
+    """PK-less advanced mode: bidirectional exceptAll() over normalized rows.
+
+    Entered either directly via comparison_mode='advanced_no_pk' or transparently
+    from run_advanced() when key_cols is empty AND pk_fallback_strategy='no_pk_advanced'.
+
+    Algorithm:
+      1. Read LH + PG; resolve compare_cols (raises on schema_drift=fail).
+      2. Project both to compare_cols with type normalization (rounded floats,
+         hex-encoded binary, JSON-encoded complex types, epoch-second timestamps).
+         The normalization mirrors compute_row_hash so two equivalent rows
+         produce identical projected tuples.
+      3. lh_only = lh_norm.exceptAll(pg_norm)  — LH rows not in PG (multiplicity preserved)
+         pg_only = pg_norm.exceptAll(lh_norm)  — PG rows not in LH (multiplicity preserved)
+      4. Status:
+           PASS                              if both diffs empty
+           FAIL → audit `count_mismatch`     if total counts differ
+           INCONCLUSIVE → audit `inconclusive` if totals match but diffs non-empty
+      5. Samples: groupBy distinct row content within each diff so high-multiplicity
+         drift collapses to one sample row + an `excess_cnt`. Sample budget split
+         evenly between sides.
+
+    Numeric tolerance:
+      Implemented by rounding numeric columns to ceil(-log10(numeric_tolerance))
+      decimal places BEFORE the set difference. This is an APPROXIMATION — values
+      straddling a rounding boundary may register as different even when
+      |lh-pg| < tolerance. For exact per-row tolerance use 'advanced' mode (PK).
+
+    Other caveats (also in startup banner):
+      - JSON/JSONB columns compared as exact text (no semantic JSON normalization)
+      - Timestamps compared at second precision (epoch seconds, UTC session TZ)
+
+    Performance:
+      exceptAll shuffles full row payloads (no hash reduction). For wide tables
+      or millions of rows this is significantly more expensive than hash_no_pk.
+      Prefer hash_no_pk if you don't need per-row evidence.
+    """
+    pg_schema  = config["pg_schema"]
+    pg_table   = config["pg_table_name"] or config["table_name"]
+    lh_schema  = config["lakehouse_schema"]
+    table_name = config["table_name"]
+    filter_col    = config["filter_column"]
+    filter_col_pg = config["filter_column_pg"] or filter_col
+    numeric_tol = config["numeric_tolerance"] or 0.001
+    skip_cols  = config["skip_cols"] if config["skip_cols"] else []
+
+    pg_df = read_postgres(pg_schema, pg_table, filter_col_pg, window_start, window_end)
+    lh_df = read_lakehouse(lh_schema, table_name, filter_col, window_start, window_end)
+
+    compare_cols = resolve_columns(lh_df, pg_df, skip_cols, config["schema_drift_policy"])
+
+    if not compare_cols:
+        return {
+            "lakehouse_count": None, "postgres_count": None, "count_match": None,
+            "rows_only_in_lakehouse": None, "rows_only_in_postgres": None,
+            "rows_with_mismatches": None,
+            "status": "DATA_QUALITY_ERROR",
+            "error_message": (
+                f"advanced_no_pk: no columns to compare for '{table_name}' after "
+                f"applying skip_cols and schema_drift_policy. Either remove "
+                f"skip_cols entries or change schema_drift_policy."
+            ),
+            "comparison_mode": "advanced_no_pk",
+        }, []
+
+    # Tolerance → decimal precision for rounding. tol=0.001 → 3 places.
+    # Capped at 8 to match compute_row_hash precision; floored at 0 (no round).
+    if numeric_tol <= 0:
+        decimals = 8
+    else:
+        decimals = min(8, max(0, int(math.ceil(-math.log10(numeric_tol)))))
+
+    def _normalize(df):
+        """Project each compare col to a deterministic string representation.
+
+        All cols come out as STRING so exceptAll's per-row equality is byte-exact
+        and tolerant to JDBC vs Lakehouse type subtleties (e.g. NUMERIC vs DOUBLE).
+        """
+        type_map = {f.name: f.dataType for f in df.schema.fields}
+        out_cols = []
+        for c in compare_cols:
+            t = type_map.get(c)
+            col = F.col(c)
+            if isinstance(t, (FloatType, DoubleType)):
+                out_cols.append(F.round(col, decimals).cast("string").alias(c))
+            elif isinstance(t, DecimalType):
+                out_cols.append(F.round(col.cast("double"), decimals).cast("string").alias(c))
+            elif isinstance(t, BinaryType):
+                out_cols.append(F.hex(col).alias(c))
+            elif isinstance(t, (ArrayType, MapType, StructType)):
+                out_cols.append(F.to_json(col).alias(c))
+            elif isinstance(t, TimestampType):
+                out_cols.append(col.cast("long").cast("string").alias(c))
+            else:
+                out_cols.append(col.cast("string").alias(c))
+        return df.select(*out_cols)
+
+    lh_norm = _normalize(lh_df.select(*compare_cols)).cache()
+    pg_norm = _normalize(pg_df.select(*compare_cols)).cache()
+
+    try:
+        lh_count = lh_norm.count()
+        pg_count = pg_norm.count()
+
+        # exceptAll: set difference preserving multiplicity. If LH has [A]x3 and
+        # PG has [A]x1, lh_only contains [A]x2.
+        lh_only = lh_norm.exceptAll(pg_norm).cache()
+        pg_only = pg_norm.exceptAll(lh_norm).cache()
+
+        try:
+            only_in_lh = lh_only.count()
+            only_in_pg = pg_only.count()
+
+            def _row_word(n):
+                return "row" if n == 1 else "rows"
+
+            if only_in_lh == 0 and only_in_pg == 0:
+                status  = "PASS"
+                err_msg = None
+            elif lh_count != pg_count:
+                status = "FAIL"
+                parts = []
+                if only_in_lh > 0:
+                    parts.append(f"{only_in_lh} extra {_row_word(only_in_lh)} in lakehouse")
+                if only_in_pg > 0:
+                    parts.append(f"{only_in_pg} extra {_row_word(only_in_pg)} in postgres")
+                err_msg = f"{', '.join(parts)} (see samples)"
+            else:
+                status = "INCONCLUSIVE"
+                err_msg = (
+                    f"row contents diverged with matching totals — "
+                    f"{only_in_lh} in lakehouse, {only_in_pg} in postgres "
+                    f"(rows shuffled or content changed; see samples)"
+                )
+
+            samples = []
+            cap_per_side = max(1, MAX_DETAIL_ROWS // 2)
+
+            # Dedupe to distinct row content within each diff; carry excess
+            # multiplicity as a count. High-multiplicity drift (e.g. 1000 copies
+            # of the same row extra) collapses to one sample + excess_cnt=1000
+            # rather than flooding the audit table with 1000 identical samples.
+            if only_in_lh > 0:
+                lh_distinct = (lh_only.groupBy(*compare_cols)
+                                      .agg(F.count("*").alias("excess_cnt"))
+                                      .limit(cap_per_side).collect())
+                for r in lh_distinct:
+                    samples.append({
+                        "mismatch_type": "only_in_lakehouse_no_pk",
+                        "pk_values": _row_to_compact_json(r, compare_cols),
+                        "column_name": None,
+                        "lakehouse_value": str(int(r["excess_cnt"])),
+                        "postgres_value": "0",
+                    })
+            if only_in_pg > 0:
+                pg_distinct = (pg_only.groupBy(*compare_cols)
+                                      .agg(F.count("*").alias("excess_cnt"))
+                                      .limit(cap_per_side).collect())
+                for r in pg_distinct:
+                    samples.append({
+                        "mismatch_type": "only_in_postgres_no_pk",
+                        "pk_values": _row_to_compact_json(r, compare_cols),
+                        "column_name": None,
+                        "lakehouse_value": "0",
+                        "postgres_value": str(int(r["excess_cnt"])),
+                    })
+
+            return {
+                "lakehouse_count": lh_count,
+                "postgres_count":  pg_count,
+                "count_match":     lh_count == pg_count,
+                "rows_only_in_lakehouse": only_in_lh,
+                "rows_only_in_postgres":  only_in_pg,
+                # No "same row, different content" classification is meaningful
+                # without a PK to pair rows on; only_lh/only_pg carry the signal.
+                "rows_with_mismatches": 0,
+                "status": status,
+                "error_message": err_msg,
+                "comparison_mode": "advanced_no_pk",
+            }, samples
+        finally:
+            lh_only.unpersist()
+            pg_only.unpersist()
+    finally:
+        lh_norm.unpersist()
+        pg_norm.unpersist()
+
+
 def run_advanced(config, window_start, window_end):
     """Advanced mode: full row-by-row, column-by-column comparison."""
     pg_schema = config["pg_schema"]
@@ -920,8 +1117,13 @@ def run_advanced(config, window_start, window_end):
 
     # Empty key_cols guard — see run_hash() for the same pattern. Advanced mode
     # joins on the PK and produces per-row diff details, neither of which is
-    # meaningful without a PK.
+    # meaningful without a PK. Phase 4 adds opt-in auto-routing to
+    # run_advanced_no_pk via pk_fallback_strategy (column added by Phase 5;
+    # operators can hit run_advanced_no_pk directly via comparison_mode='advanced_no_pk').
     if not pk_cols:
+        fallback = (config.asDict().get("pk_fallback_strategy") or "").lower()
+        if fallback == "no_pk_advanced":
+            return run_advanced_no_pk(config, window_start, window_end)
         return {
             "lakehouse_count": None, "postgres_count": None, "count_match": None,
             "rows_only_in_lakehouse": None, "rows_only_in_postgres": None,
@@ -931,7 +1133,7 @@ def run_advanced(config, window_start, window_end):
                 f"comparison_mode='advanced' requires entries in "
                 f"validation.comparison_key_columns for table '{table_name}'. "
                 f"Either populate the PK columns, switch comparison_mode to "
-                f"'basic' or 'fingerprint', or set "
+                f"'basic', 'advanced_no_pk', or 'fingerprint', or set "
                 f"pk_fallback_strategy='no_pk_advanced' (Phase 5)."
             ),
         }, []
@@ -1171,6 +1373,8 @@ for tbl_cfg in configs:
             result, sample_rows = run_hash_no_pk(tbl_cfg, window_start, window_end)
         elif mode == "advanced":
             result, sample_rows = run_advanced(tbl_cfg, window_start, window_end)
+        elif mode == "advanced_no_pk":
+            result, sample_rows = run_advanced_no_pk(tbl_cfg, window_start, window_end)
         else:
             result = {"status": "ERROR", "error_message": f"Unknown mode: {mode}",
                       "lakehouse_count": None, "postgres_count": None, "count_match": None,

@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS validation.comparison_config (
     pg_schema           STRING      COMMENT 'PostgreSQL schema name',
     pg_table_name       STRING      COMMENT 'PostgreSQL table name (if different from table_name)',
     lakehouse_schema    STRING      COMMENT 'Lakehouse schema name',
-    comparison_mode     STRING      COMMENT 'basic | hash | advanced',
+    comparison_mode     STRING      COMMENT 'basic | hash | hash_no_pk | advanced | advanced_no_pk',
     filter_column       STRING      COMMENT 'Date/timestamp column for windowed compare',
     filter_column_pg    STRING      COMMENT 'Override if Postgres filter column name differs',
     filter_days         INT         COMMENT 'Lookback window in days',
@@ -57,11 +57,23 @@ CREATE TABLE IF NOT EXISTS validation.comparison_config (
     numeric_tolerance   DOUBLE      COMMENT 'Tolerance for float/decimal comparison',
     max_rows_advanced   INT         COMMENT 'Row cap before falling back to hash mode',
     severity            STRING      COMMENT 'critical | warning | info',
-    enabled             BOOLEAN     COMMENT 'Whether this table is active for comparison'
+    enabled             BOOLEAN     COMMENT 'Whether this table is active for comparison',
+    pk_fallback_strategy STRING     COMMENT 'fail | no_pk_hash | no_pk_advanced — what to do when comparison_mode requires a PK but key_cols is empty (default fail)'
 )
 USING DELTA
 COMMENT 'Metadata config for Lakehouse vs PostgreSQL comparison'
 """)
+
+# Idempotent ALTER for deployments where the table existed before Phase 5.
+# Delta has no `ADD COLUMN IF NOT EXISTS`, so check the schema first.
+_existing_cfg_cols = {f.name for f in spark.table("validation.comparison_config").schema.fields}
+if "pk_fallback_strategy" not in _existing_cfg_cols:
+    spark.sql("""
+        ALTER TABLE validation.comparison_config
+        ADD COLUMNS (pk_fallback_strategy STRING
+            COMMENT 'fail | no_pk_hash | no_pk_advanced — what to do when comparison_mode requires a PK but key_cols is empty (default fail)')
+    """)
+    print("✅ Added pk_fallback_strategy column to validation.comparison_config")
 
 # ── 2. comparison_key_columns ─────────────────────────────────────────────────
 
@@ -331,24 +343,19 @@ else:
 
 # In[3b]:
 
-# ── Seed PK-less fixtures (no_pk validation, phases 3/4) ──────────────────────
-# These tables intentionally have NO PRIMARY KEY. They are registered with
-# enabled=False because the current engine raises ValueError on empty key_cols
-# (Phase 1 safety guard at comparison_engine.py:575). Phase 5 will introduce
-# `pk_fallback_strategy` and flip these to enabled=True.
-#
-# TODO(phase5): once pk_fallback_strategy column lands, set enabled=True and add
-# pk_fallback_strategy values: event_log='no_pk_hash', sensor_readings='no_pk_hash',
-# landing_orders='no_pk_advanced'.
+# ── Seed PK-less fixtures (no_pk validation, phases 3/4/5) ────────────────────
+# These tables intentionally have NO PRIMARY KEY. Phase 5 enables them with
+# pk_fallback_strategy so the engine routes to run_hash_no_pk / run_advanced_no_pk
+# instead of raising DATA_QUALITY_ERROR on empty key_cols.
 
 PK_LESS_TABLES = [
-    # (table_name, mode, filter_column, filter_days, drift_policy, severity)
+    # (table_name, mode, filter_column, filter_days, drift_policy, severity, pk_fallback_strategy)
     # event_log  → hash-no-PK fixture; strict drift (catches accidental column adds)
-    ("event_log",       "hash",     "event_ts",    7, "fail",      "warning"),
+    ("event_log",       "hash",     "event_ts",    7, "fail",      "warning", "no_pk_hash"),
     # sensor_readings → hash-no-PK fixture with natural duplicates (multiset behavior)
-    ("sensor_readings", "hash",     "reading_ts",  7, "intersect", "warning"),
+    ("sensor_readings", "hash",     "reading_ts",  7, "intersect", "warning", "no_pk_hash"),
     # landing_orders → advanced-no-PK fixture; retry-dup payloads exercise exceptAll()
-    ("landing_orders",  "advanced", "received_at", 7, "intersect", "warning"),
+    ("landing_orders",  "advanced", "received_at", 7, "intersect", "warning", "no_pk_advanced"),
 ]
 
 existing_tables = [r["table_name"] for r in spark.sql(
@@ -358,7 +365,7 @@ new_pk_less = [t for t in PK_LESS_TABLES if t[0] not in existing_tables]
 
 if new_pk_less:
     config_rows = []
-    for tbl, mode, filt_col, filt_days, drift, sev in new_pk_less:
+    for tbl, mode, filt_col, filt_days, drift, sev, strategy in new_pk_less:
         config_rows.append(Row(
             table_name=tbl,
             pg_schema="healthcare",
@@ -373,7 +380,8 @@ if new_pk_less:
             numeric_tolerance=0.0,
             max_rows_advanced=500000,
             severity=sev,
-            enabled=False,  # phase5 flips to True alongside pk_fallback_strategy
+            enabled=True,
+            pk_fallback_strategy=strategy,
         ))
 
     config_schema = StructType([
@@ -391,16 +399,28 @@ if new_pk_less:
         StructField("max_rows_advanced", IntegerType()),
         StructField("severity", StringType()),
         StructField("enabled", BooleanType()),
+        StructField("pk_fallback_strategy", StringType()),
     ])
     spark.createDataFrame(config_rows, config_schema).write \
         .format("delta").mode("append").saveAsTable("validation.comparison_config")
 
-    # No key_cols and no skip_cols — empty by design. Phase 5 may add skip
-    # entries for noisy timestamps if needed.
+    # No key_cols and no skip_cols — empty by design for PK-less tables.
 
-    print(f"✅ Seeded {len(new_pk_less)} PK-less fixtures (enabled=False — phase5 will enable)")
+    print(f"✅ Seeded {len(new_pk_less)} PK-less fixtures (enabled with pk_fallback_strategy)")
 else:
-    print(f"⏭️  PK-less fixtures already configured — skipping")
+    print(f"⏭️  PK-less fixtures already present in comparison_config")
+
+# Idempotent flip: ensure existing rows for PK-less tables have the strategy
+# set and enabled=True (handles deployments seeded before Phase 5 with
+# enabled=False and pk_fallback_strategy=NULL).
+for tbl, _mode, _fc, _fd, _drift, _sev, strategy in PK_LESS_TABLES:
+    spark.sql(f"""
+        UPDATE validation.comparison_config
+        SET enabled = true, pk_fallback_strategy = '{strategy}'
+        WHERE table_name = '{tbl}'
+          AND (enabled = false OR pk_fallback_strategy IS NULL OR pk_fallback_strategy <> '{strategy}')
+    """)
+print("✅ PK-less fixtures: enabled=true and pk_fallback_strategy set")
 
 
 # In[4]:
