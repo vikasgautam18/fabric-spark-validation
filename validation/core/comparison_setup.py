@@ -329,6 +329,80 @@ else:
     print(f"⏭️  Extended type tables already configured — skipping")
 
 
+# In[3b]:
+
+# ── Seed PK-less fixtures (no_pk validation, phases 3/4) ──────────────────────
+# These tables intentionally have NO PRIMARY KEY. They are registered with
+# enabled=False because the current engine raises ValueError on empty key_cols
+# (Phase 1 safety guard at comparison_engine.py:575). Phase 5 will introduce
+# `pk_fallback_strategy` and flip these to enabled=True.
+#
+# TODO(phase5): once pk_fallback_strategy column lands, set enabled=True and add
+# pk_fallback_strategy values: event_log='no_pk_hash', sensor_readings='no_pk_hash',
+# landing_orders='no_pk_advanced'.
+
+PK_LESS_TABLES = [
+    # (table_name, mode, filter_column, filter_days, drift_policy, severity)
+    # event_log  → hash-no-PK fixture; strict drift (catches accidental column adds)
+    ("event_log",       "hash",     "event_ts",    7, "fail",      "warning"),
+    # sensor_readings → hash-no-PK fixture with natural duplicates (multiset behavior)
+    ("sensor_readings", "hash",     "reading_ts",  7, "intersect", "warning"),
+    # landing_orders → advanced-no-PK fixture; retry-dup payloads exercise exceptAll()
+    ("landing_orders",  "advanced", "received_at", 7, "intersect", "warning"),
+]
+
+existing_tables = [r["table_name"] for r in spark.sql(
+    "SELECT table_name FROM validation.comparison_config"
+).collect()]
+new_pk_less = [t for t in PK_LESS_TABLES if t[0] not in existing_tables]
+
+if new_pk_less:
+    config_rows = []
+    for tbl, mode, filt_col, filt_days, drift, sev in new_pk_less:
+        config_rows.append(Row(
+            table_name=tbl,
+            pg_schema="healthcare",
+            pg_table_name=tbl,
+            lakehouse_schema="silver",
+            comparison_mode=mode,
+            filter_column=filt_col,
+            filter_column_pg=None,
+            filter_days=filt_days,
+            safety_lag_minutes=30,
+            schema_drift_policy=drift,
+            numeric_tolerance=0.0,
+            max_rows_advanced=500000,
+            severity=sev,
+            enabled=False,  # phase5 flips to True alongside pk_fallback_strategy
+        ))
+
+    config_schema = StructType([
+        StructField("table_name", StringType()),
+        StructField("pg_schema", StringType()),
+        StructField("pg_table_name", StringType()),
+        StructField("lakehouse_schema", StringType()),
+        StructField("comparison_mode", StringType()),
+        StructField("filter_column", StringType()),
+        StructField("filter_column_pg", StringType()),
+        StructField("filter_days", IntegerType()),
+        StructField("safety_lag_minutes", IntegerType()),
+        StructField("schema_drift_policy", StringType()),
+        StructField("numeric_tolerance", DoubleType()),
+        StructField("max_rows_advanced", IntegerType()),
+        StructField("severity", StringType()),
+        StructField("enabled", BooleanType()),
+    ])
+    spark.createDataFrame(config_rows, config_schema).write \
+        .format("delta").mode("append").saveAsTable("validation.comparison_config")
+
+    # No key_cols and no skip_cols — empty by design. Phase 5 may add skip
+    # entries for noisy timestamps if needed.
+
+    print(f"✅ Seeded {len(new_pk_less)} PK-less fixtures (enabled=False — phase5 will enable)")
+else:
+    print(f"⏭️  PK-less fixtures already configured — skipping")
+
+
 # In[4]:
 
 # ── Seed advanced fixture: audit_events ───────────────────────────────────────

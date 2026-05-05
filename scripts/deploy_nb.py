@@ -2,19 +2,28 @@
 """Deploy a Fabric notebook from a .py source.
 
 Usage:
-    deploy_nb.py <local.py> <displayName> <folderId> [<existingNotebookId>]
+    deploy_nb.py <local.py> <displayName> [<folderId>] [<existingNotebookId>]
 
-If <existingNotebookId> is omitted, the script auto-detects an existing
-notebook with the same displayName in the target workspace + folder
-and updates it; if none is found, a new notebook is created.
+Both <folderId> and <existingNotebookId> are optional:
+  • If <folderId> is omitted, the notebook is created/updated at workspace root.
+    Auto-detect still finds an existing notebook by displayName anywhere in
+    the workspace (displayName is workspace-unique).
+  • If <existingNotebookId> is omitted, the script auto-detects an existing
+    notebook with the same displayName and updates it; otherwise creates new.
+
+Environment overrides:
+  FABRIC_WORKSPACE_ID — target workspace GUID (default: msdemo workspace)
+  FABRIC_FOLDER_ID    — default folderId when not given on the command line
 
 Cell separator in .py:  lines beginning with "# In[N]:" mark cell starts.
 Magic-only cells (lines like "%run something") are written as-is into the
 ipynb cell source so Fabric's magic dispatcher picks them up.
 """
-import sys, json, base64, re, subprocess, time, urllib.request, urllib.error
+import os, sys, json, base64, re, subprocess, time, urllib.request, urllib.error
 
-WORKSPACE_ID  = "e692fb91-ab30-4b11-a11a-22da087d11d7"
+WORKSPACE_ID  = os.environ.get(
+    "FABRIC_WORKSPACE_ID", "e692fb91-ab30-4b11-a11a-22da087d11d7"
+)
 LH_ID         = "5ab25b21-a8a5-4c8b-8237-290290db6dd9"
 LH_NAME       = "lhdemo"
 FABRIC_AUD    = "https://api.fabric.microsoft.com"
@@ -127,10 +136,14 @@ def find_notebook(name, folder, headers):
 
 
 def main():
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 3:
         print(__doc__); sys.exit(1)
-    py_path, name, folder = sys.argv[1], sys.argv[2], sys.argv[3]
-    nb_id = sys.argv[4] if len(sys.argv) > 4 else None
+    py_path, name = sys.argv[1], sys.argv[2]
+    folder = sys.argv[3] if len(sys.argv) > 3 else os.environ.get("FABRIC_FOLDER_ID")
+    nb_id  = sys.argv[4] if len(sys.argv) > 4 else None
+
+    print(f"  workspace: {WORKSPACE_ID}"
+          + (f"  folder: {folder}" if folder else "  folder: <root>"))
 
     with open(py_path) as f:
         nb = py_to_ipynb(f.read())
@@ -150,8 +163,10 @@ def main():
         body = {"definition": {"format": "ipynb", "parts": parts}}
     else:
         url = f"{FABRIC_AUD}/v1/workspaces/{WORKSPACE_ID}/items"
-        body = {"displayName": name, "type": "Notebook", "folderId": folder,
+        body = {"displayName": name, "type": "Notebook",
                 "definition": {"format": "ipynb", "parts": parts}}
+        if folder:
+            body["folderId"] = folder
 
     status, headers, resp = http("POST", url, H, body)
     print(f"POST {status}")

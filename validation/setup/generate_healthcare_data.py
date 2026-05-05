@@ -21,6 +21,11 @@
 #  10. audit_events            — composite PK (3 cols), TIMESTAMPTZ filter
 #                                  (production-hardening test fixture)
 #
+# Tables (PK-less fixtures — for no-PK validation phases 3/4):
+#  11. event_log         — append-only system events (NO PRIMARY KEY by design)
+#  12. sensor_readings   — IoT telemetry with natural duplicates (NO PRIMARY KEY by design)
+#  13. landing_orders    — webhook landing with intentional retry duplicates (NO PRIMARY KEY by design)
+#
 # Configuration:
 #   - Set DROP_AND_RECREATE = True to wipe all tables and start fresh
 #   - Set DROP_AND_RECREATE = False (default) to append + update
@@ -54,6 +59,20 @@ NUM_COMPLEX_ROWS = 200
 NUM_EDGE_CASE_ROWS = 100
 NUM_AUDIT_EVENT_ROWS = 200
 
+# Number of records per run (PK-less fixtures — no_pk validation, phases 3/4)
+# Defaults are correctness-sized; bump to 10_000+ for local performance stress.
+NUM_EVENT_LOG_ROWS = 1000
+NUM_SENSOR_READING_ROWS = 800
+NUM_LANDING_ORDER_ROWS = 500
+# Probability that a sensor reading collides on (sensor_kind, location, value) with
+# another reading at the same wall-clock second — exercises multiset duplicate handling
+# in run_hash_no_pk (Phase 3).
+SENSOR_DUP_RATE = 0.15
+# Probability that a landing_orders row is a webhook retry duplicate of the previous
+# row (same order_ref, same payload, slightly later received_at) — exercises bidirectional
+# exceptAll() with intentional duplicates in run_advanced_no_pk (Phase 4).
+LANDING_RETRY_RATE = 0.10
+
 # Convenience aliases — the rest of the notebook references these names directly.
 PG_HOST     = cfg["pg_host"]
 PG_PORT     = cfg["pg_port"]
@@ -80,6 +99,9 @@ print(f"Extended:   {NUM_SHOWCASE_ROWS} showcase, {NUM_COMPLEX_ROWS} complex, "
 
 # Drop statements — reverse dependency order
 DROP_STATEMENTS = f"""
+DROP TABLE IF EXISTS {PG_SCHEMA}.landing_orders CASCADE;
+DROP TABLE IF EXISTS {PG_SCHEMA}.sensor_readings CASCADE;
+DROP TABLE IF EXISTS {PG_SCHEMA}.event_log CASCADE;
 DROP TABLE IF EXISTS {PG_SCHEMA}.audit_events CASCADE;
 DROP TABLE IF EXISTS {PG_SCHEMA}.edge_cases CASCADE;
 DROP TABLE IF EXISTS {PG_SCHEMA}.complex_types_showcase CASCADE;
@@ -268,16 +290,75 @@ CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.audit_events (
     last_updated        TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (tenant_id, entity_id, version)
 );
+
+-- ─── PK-less fixtures (no PRIMARY KEY by design — phases 3/4 no_pk validation) ───
+-- These tables intentionally omit PRIMARY KEY to exercise:
+--   • run_hash_no_pk — multiset count diff over compute_row_hash (Phase 3)
+--   • run_advanced_no_pk — bidirectional exceptAll() (Phase 4)
+--   • pk_fallback_strategy dispatch (Phase 5)
+
+-- event_log: append-only system event stream. No natural PK — events at the same
+-- nanosecond from the same source are legitimate. Hash-no-PK fixture.
+CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.event_log (
+    event_ts            TIMESTAMP   NOT NULL,
+    event_type          TEXT        NOT NULL,
+    source              TEXT,
+    severity            TEXT,
+    message             TEXT,
+    actor_id            TEXT,
+    last_updated        TIMESTAMP   DEFAULT NOW(),
+    created_at          TIMESTAMP   DEFAULT NOW()
+);
+
+-- sensor_readings: IoT telemetry. Multiple identical sensors at the same location
+-- can legitimately emit the same reading at the same second. Tests duplicate-row
+-- multiset behavior in hash-no-PK mode.
+CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.sensor_readings (
+    reading_ts          TIMESTAMP           NOT NULL,
+    sensor_kind         TEXT                NOT NULL,
+    location            TEXT,
+    value               DOUBLE PRECISION,
+    unit                TEXT,
+    quality             TEXT,
+    last_updated        TIMESTAMP           DEFAULT NOW(),
+    created_at          TIMESTAMP           DEFAULT NOW()
+);
+
+-- landing_orders: webhook landing/staging. order_ref repeats are EXPECTED (retry
+-- duplicates from the upstream webhook). Advanced-no-PK fixture for bidirectional
+-- exceptAll() with intentional duplicates.
+CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.landing_orders (
+    received_at         TIMESTAMP           NOT NULL,
+    order_ref           TEXT                NOT NULL,
+    customer_email      TEXT,
+    total_amount        NUMERIC(10,2),
+    currency            TEXT,
+    status              TEXT,
+    payload_json        JSONB,
+    last_updated        TIMESTAMP           DEFAULT NOW(),
+    created_at          TIMESTAMP           DEFAULT NOW()
+);
 """
 
 def run_ddl(statements):
-    """Run DDL via py4j JDBC connection."""
+    """Run DDL via py4j JDBC connection.
+
+    Strips ``--`` line comments before splitting on ``;`` so that comment
+    text containing semicolons (e.g. ``-- No PK; events ...``) does not
+    create spurious chunks. Block comments and dollar-quoted strings are
+    not handled — keep DDL simple.
+    """
     spark._jvm.Class.forName("org.postgresql.Driver")
     conn = spark._jvm.java.sql.DriverManager.getConnection(JDBC_URL, PG_USER, PG_PASSWORD)
     try:
         conn.setAutoCommit(False)
         stmt = conn.createStatement()
-        for sql in statements.split(";"):
+        # Strip "-- ..." line comments first so semicolons inside comments
+        # don't break the naive split below.
+        sanitized = "\n".join(
+            line.split("--", 1)[0] for line in statements.splitlines()
+        )
+        for sql in sanitized.split(";"):
             sql = sql.strip()
             if sql:
                 stmt.execute(sql)
@@ -701,13 +782,127 @@ def generate_audit_event_rows(n):
     return rows
 
 
+# ── PK-less fixture generators (no PRIMARY KEY by design — phases 3/4) ──────────
+
+def generate_event_log_rows(n):
+    """Append-only system event stream. No PK; events at the same nanosecond from
+    the same source are valid. Spread across last 7 days for filter window."""
+    rows = []
+    now = datetime.utcnow()
+    event_types = ["login", "logout", "click", "view", "api_call", "error", "timeout"]
+    sources    = ["web", "mobile", "api", "scheduler", "worker"]
+    severities = ["info", "warn", "error", "debug"]
+    for i in range(n):
+        ts = now - timedelta(seconds=random.randint(0, 7 * 24 * 3600))
+        rows.append(Row(
+            event_ts=ts,
+            event_type=random.choice(event_types),
+            source=random.choice(sources),
+            severity=random.choice(severities),
+            message=f"event {i} batch {BATCH_ID}",
+            actor_id=(f"user_{random.randint(1, 50):03d}" if random.random() > 0.3 else None),
+            last_updated=ts,
+            created_at=ts,
+        ))
+    return rows
+
+
+def generate_sensor_reading_rows(n, dup_rate=SENSOR_DUP_RATE):
+    """IoT telemetry. Designed to legitimately produce duplicate (ts, kind, location,
+    value) tuples — exercises multiset duplicate handling in run_hash_no_pk."""
+    rows = []
+    now = datetime.utcnow()
+    sensor_kinds = ["temp", "humidity", "pressure", "voltage", "current"]
+    locations    = [f"site_{i:02d}" for i in range(8)]
+    qualities    = ["good", "good", "good", "suspect", "bad"]  # weighted
+    units_for = {"temp": "C", "humidity": "%", "pressure": "kPa",
+                 "voltage": "V", "current": "A"}
+    last_row = None
+    for i in range(n):
+        # Duplicate the previous row (same ts/kind/loc/value) with probability dup_rate.
+        if last_row is not None and random.random() < dup_rate:
+            rows.append(last_row)
+            continue
+        ts = now - timedelta(seconds=random.randint(0, 7 * 24 * 3600))
+        kind = random.choice(sensor_kinds)
+        # Quantize to 1 decimal so collisions occur naturally too.
+        val = round(random.uniform(0.0, 100.0), 1)
+        new_row = Row(
+            reading_ts=ts,
+            sensor_kind=kind,
+            location=random.choice(locations),
+            value=val,
+            unit=units_for[kind],
+            quality=random.choice(qualities),
+            last_updated=ts,
+            created_at=ts,
+        )
+        rows.append(new_row)
+        last_row = new_row
+    return rows
+
+
+def generate_landing_order_rows(n, retry_rate=LANDING_RETRY_RATE):
+    """Webhook landing/staging. order_ref repeats are EXPECTED (upstream retry
+    duplicates). Exercises bidirectional exceptAll() with intentional duplicates."""
+    rows = []
+    now = datetime.utcnow()
+    currencies = ["USD", "EUR", "GBP", "INR"]
+    statuses   = ["pending", "confirmed", "cancelled"]
+    last_row = None
+    for i in range(n):
+        # Webhook retry: replay the previous row with a slightly-later received_at.
+        if last_row is not None and random.random() < retry_rate:
+            retry_ts = last_row["received_at"] + timedelta(milliseconds=random.randint(50, 1500))
+            rows.append(Row(
+                received_at=retry_ts,
+                order_ref=last_row["order_ref"],
+                customer_email=last_row["customer_email"],
+                total_amount=last_row["total_amount"],
+                currency=last_row["currency"],
+                status=last_row["status"],
+                payload_json=last_row["payload_json"],
+                last_updated=retry_ts,
+                created_at=retry_ts,
+            ))
+            continue
+        ts = now - timedelta(seconds=random.randint(0, 7 * 24 * 3600))
+        order_ref = f"ord-{BATCH_ID}-{i:06d}"
+        amount = Decimal(str(round(random.uniform(5.00, 5000.00), 2)))
+        payload = json.dumps({
+            "order_ref": order_ref,
+            "items": random.randint(1, 10),
+            "channel": random.choice(["web", "mobile", "marketplace"]),
+            "batch": BATCH_ID,
+        })
+        new_row = Row(
+            received_at=ts,
+            order_ref=order_ref,
+            customer_email=f"cust_{random.randint(1, 200):04d}@example.com",
+            total_amount=amount,
+            currency=random.choice(currencies),
+            status=random.choice(statuses),
+            payload_json=payload,
+            last_updated=ts,
+            created_at=ts,
+        )
+        rows.append(new_row)
+        last_row = new_row
+    return rows
+
+
 print(f"Generating extended types data...")
 showcase_rows = generate_showcase_rows(NUM_SHOWCASE_ROWS)
 complex_rows = generate_complex_rows(NUM_COMPLEX_ROWS)
 edge_rows = generate_edge_case_rows(NUM_EDGE_CASE_ROWS)
 audit_rows = generate_audit_event_rows(NUM_AUDIT_EVENT_ROWS)
+event_log_rows = generate_event_log_rows(NUM_EVENT_LOG_ROWS)
+sensor_rows = generate_sensor_reading_rows(NUM_SENSOR_READING_ROWS)
+landing_rows = generate_landing_order_rows(NUM_LANDING_ORDER_ROWS)
 print(f"✅ Generated: {len(showcase_rows)} showcase, {len(complex_rows)} complex, "
       f"{len(edge_rows)} edge_cases, {len(audit_rows)} audit_events")
+print(f"✅ Generated PK-less: {len(event_log_rows)} event_log, "
+      f"{len(sensor_rows)} sensor_readings, {len(landing_rows)} landing_orders")
 
 
 # In[6]:
@@ -856,7 +1051,43 @@ EXTENDED_TABLES = [
     ])),
 ]
 
-ALL_TABLES = HEALTHCARE_TABLES + EXTENDED_TABLES
+# PK-less fixtures (no PRIMARY KEY by design — phases 3/4 no_pk validation)
+PK_LESS_TABLES = [
+    ("event_log", event_log_rows, StructType([
+        StructField("event_ts", TimestampType(), nullable=False),
+        StructField("event_type", StringType(), nullable=False),
+        StructField("source", StringType()),
+        StructField("severity", StringType()),
+        StructField("message", StringType()),
+        StructField("actor_id", StringType()),
+        StructField("last_updated", TimestampType()),
+        StructField("created_at", TimestampType()),
+    ])),
+    ("sensor_readings", sensor_rows, StructType([
+        StructField("reading_ts", TimestampType(), nullable=False),
+        StructField("sensor_kind", StringType(), nullable=False),
+        StructField("location", StringType()),
+        StructField("value", DoubleType()),
+        StructField("unit", StringType()),
+        StructField("quality", StringType()),
+        StructField("last_updated", TimestampType()),
+        StructField("created_at", TimestampType()),
+    ])),
+    ("landing_orders", landing_rows, StructType([
+        StructField("received_at", TimestampType(), nullable=False),
+        StructField("order_ref", StringType(), nullable=False),
+        StructField("customer_email", StringType()),
+        StructField("total_amount", DecimalType(10, 2)),
+        StructField("currency", StringType()),
+        StructField("status", StringType()),
+        # JSONB stored as string; Postgres JDBC accepts it via implicit cast.
+        StructField("payload_json", StringType()),
+        StructField("last_updated", TimestampType()),
+        StructField("created_at", TimestampType()),
+    ])),
+]
+
+ALL_TABLES = HEALTHCARE_TABLES + EXTENDED_TABLES + PK_LESS_TABLES
 
 print(f"\nWriting batch {BATCH_ID} to PostgreSQL ({PG_SCHEMA} schema)...\n")
 
@@ -1006,7 +1237,12 @@ print(f"    • data_type_showcase:     {NUM_SHOWCASE_ROWS} new rows (25 columns
 print(f"    • complex_types_showcase: {NUM_COMPLEX_ROWS} new rows (18 columns)")
 print(f"    • edge_cases:             {NUM_EDGE_CASE_ROWS} new rows (28 columns)")
 print(f"    • audit_events:           {NUM_AUDIT_EVENT_ROWS} new rows (composite PK + TIMESTAMPTZ)")
+print(f"\n  PK-less fixtures (3) — for no-PK validation phases 3/4:")
+print(f"    • event_log:              {NUM_EVENT_LOG_ROWS} new rows (no PK; append-only events)")
+print(f"    • sensor_readings:        {NUM_SENSOR_READING_ROWS} new rows (no PK; ~{int(SENSOR_DUP_RATE*100)}% natural dups)")
+print(f"    • landing_orders:         {NUM_LANDING_ORDER_ROWS} new rows (no PK; ~{int(LANDING_RETRY_RATE*100)}% retry dups, JSONB)")
 print(f"\n  ~30% of ALL existing rows updated with last_updated = NOW()")
+print(f"  (PK-less fixtures are append-only — no UPDATE pass.)")
 print(f"\n  Next steps:")
 print(f"    1. Run getDataFromPostgres to copy to Lakehouse")
 print(f"    2. Run comparison_setup to register tables")
