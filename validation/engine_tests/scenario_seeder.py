@@ -339,6 +339,197 @@ def mutation_clear_key_cols():
     print(f"  ✅ backed up {snap_count} key_column row(s) to {_PK_BACKUP_TABLE} and cleared metadata")
 
 
+def _pick_in_window_rows(n):
+    """Return the most-recent N rows from {fqn} as a list of pyspark Row objects.
+
+    Uses filter_col DESC if available so rows are guaranteed in-window for the
+    next engine run. Falls back to LIMIT-only ordering when filter_col is an
+    expression. Used by the no_pk mutations which cannot rely on PK-based row
+    selection.
+    """
+    if filter_col_simple:
+        rows = spark.sql(
+            f"SELECT * FROM {fqn} ORDER BY {filter_col_simple} DESC LIMIT {n}"
+        ).collect()
+    else:
+        rows = spark.sql(f"SELECT * FROM {fqn} LIMIT {n}").collect()
+    if not rows:
+        raise RuntimeError(f"{fqn} is empty — cannot select rows. Re-import baseline first.")
+    return rows
+
+
+def _bump_filter_into_window(df):
+    """If filter_col is a timestamp column, set it to current_timestamp - 1h so
+    the appended rows fall inside the engine lookback window."""
+    if not filter_col_simple:
+        return df
+    ftype = next(
+        (f.dataType.typeName() for f in df.schema.fields if f.name == filter_col_simple),
+        None,
+    )
+    if ftype == "timestamp":
+        return df.withColumn(filter_col_simple, F.expr("current_timestamp() - INTERVAL 1 HOUR"))
+    return df
+
+
+def mutation_delete_rows_no_pk():
+    """Delete N rows from a PK-less table by snapshotting all columns and
+    deleting on a row-equality predicate. Uses filter_col DESC to target
+    in-window rows so the engine actually sees the drift.
+
+    Built for tables with `pk_fallback_strategy='no_pk_hash'` /
+    `'no_pk_advanced'` — never call on tables with declared key_cols.
+    """
+    n = int(mutation_params.get("count", 1))
+    victim_rows = _pick_in_window_rows(n)
+    actual = len(victim_rows)
+    cols = [f.name for f in spark.table(fqn).schema.fields]
+
+    def _lit(v):
+        if v is None:
+            return "NULL"
+        if isinstance(v, str):
+            return "'" + v.replace("'", "''") + "'"
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        # datetimes, decimals, numerics — delegate to repr() then strip Python wrappers
+        s = repr(v)
+        # Python datetime repr is `datetime.datetime(2024, 1, 1, ...)`; safer to
+        # cast string. Use timestamp() for datetime-like:
+        from datetime import datetime as _dt, date as _date
+        if isinstance(v, (_dt, _date)):
+            return "TIMESTAMP '" + v.isoformat(sep=" ") + "'"
+        return s
+
+    clauses = []
+    for r in victim_rows:
+        parts = []
+        for c in cols:
+            val = r[c]
+            if val is None:
+                parts.append(f"{c} IS NULL")
+            else:
+                parts.append(f"{c} = {_lit(val)}")
+        clauses.append("(" + " AND ".join(parts) + ")")
+    predicate = " OR ".join(clauses)
+    # DELETE may match more than `n` if rows are exact-duplicates. That is
+    # acceptable for a no-PK fixture and the asserter's count-delta tolerance
+    # absorbs the variance.
+    spark.sql(f"DELETE FROM {fqn} WHERE {predicate}")
+    print(f"  ✅ deleted up to {actual} row(s) (no-PK row-equality predicate)")
+
+
+def mutation_insert_extra_rows_no_pk():
+    """Append N cloned rows to a PK-less table.
+
+    mutation_params:
+      count   (int, default 1)
+      mutate  (bool, default False) — when True, alters one non-filter column to
+              guarantee the appended row is byte-distinct from any existing
+              row (exercises the only_in_lakehouse_multiset path). When False,
+              produces a verbatim duplicate (exercises the multiset_count_diff
+              path).
+    """
+    n = int(mutation_params.get("count", 1))
+    mutate = bool(mutation_params.get("mutate", False))
+    victim_rows = _pick_in_window_rows(n)
+    sample_df = spark.createDataFrame(victim_rows, spark.table(fqn).schema)
+    sample_df = _bump_filter_into_window(sample_df)
+
+    if mutate:
+        # Pick a string column that isn't the filter col — append a sentinel.
+        # If no string col exists, fall back to a numeric col + small offset.
+        str_cols = [
+            f.name for f in sample_df.schema.fields
+            if f.dataType.typeName() == "string" and f.name != filter_col_simple
+        ]
+        if str_cols:
+            target_col = str_cols[0]
+            sentinel = f"_scn_{scenario_id[:32]}"
+            sample_df = sample_df.withColumn(
+                target_col,
+                F.concat(F.coalesce(F.col(target_col), F.lit("")), F.lit(sentinel)),
+            )
+            print(f"  · mutated column '{target_col}' (+sentinel) to ensure uniqueness")
+        else:
+            num_cols = [
+                f.name for f in sample_df.schema.fields
+                if f.dataType.typeName() in ("integer", "long", "double", "float", "decimal")
+                and f.name != filter_col_simple
+            ]
+            if not num_cols:
+                raise RuntimeError(
+                    "insert_extra_rows_no_pk(mutate=True) needs a string or numeric "
+                    "non-filter column to mutate"
+                )
+            target_col = num_cols[0]
+            sample_df = sample_df.withColumn(target_col, F.col(target_col) + F.lit(1))
+            print(f"  · mutated column '{target_col}' (+1) to ensure uniqueness")
+
+    sample_df.write.format("delta").mode("append").saveAsTable(fqn)
+    print(f"  ✅ appended {sample_df.count()} no-PK row(s) (mutate={mutate})")
+
+
+def mutation_content_swap_no_pk():
+    """Delete one in-window row and append one different (mutated) in-window row.
+
+    Net count is unchanged but the multiset diverges. For hash_no_pk, this
+    produces status=INCONCLUSIVE (totals match, hashes don't). For
+    advanced_no_pk, exceptAll surfaces both sides → FAIL+count_match=True →
+    status=hash_mismatch.
+    """
+    # Phase A: delete 1
+    saved_n = int(mutation_params.get("count", 1))
+    if saved_n != 1:
+        # We support count=1 only. Multi-swap can be added later if a scenario
+        # demands it; the assertion logic stays simpler with single-row swap.
+        print(f"  ⚠️  count={saved_n} requested but content_swap_no_pk only supports 1; using 1")
+    victim_rows = _pick_in_window_rows(1)
+    cols = [f.name for f in spark.table(fqn).schema.fields]
+
+    def _lit(v):
+        if v is None:
+            return "NULL"
+        if isinstance(v, str):
+            return "'" + v.replace("'", "''") + "'"
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        from datetime import datetime as _dt, date as _date
+        if isinstance(v, (_dt, _date)):
+            return "TIMESTAMP '" + v.isoformat(sep=" ") + "'"
+        return repr(v)
+
+    r = victim_rows[0]
+    parts = [f"{c} IS NULL" if r[c] is None else f"{c} = {_lit(r[c])}" for c in cols]
+    spark.sql(f"DELETE FROM {fqn} WHERE " + " AND ".join(parts))
+    # Phase B: append a mutated copy. Inline so we don't smash mutation_params.
+    sample_df = spark.createDataFrame([r], spark.table(fqn).schema)
+    sample_df = _bump_filter_into_window(sample_df)
+    str_cols = [
+        f.name for f in sample_df.schema.fields
+        if f.dataType.typeName() == "string" and f.name != filter_col_simple
+    ]
+    if str_cols:
+        target_col = str_cols[0]
+        sample_df = sample_df.withColumn(
+            target_col,
+            F.concat(F.coalesce(F.col(target_col), F.lit("")), F.lit(f"_swap_{scenario_id[:24]}")),
+        )
+    else:
+        num_cols = [
+            f.name for f in sample_df.schema.fields
+            if f.dataType.typeName() in ("integer", "long", "double", "float", "decimal")
+            and f.name != filter_col_simple
+        ]
+        if not num_cols:
+            raise RuntimeError(
+                "content_swap_no_pk needs a string or numeric non-filter column to mutate"
+            )
+        sample_df = sample_df.withColumn(num_cols[0], F.col(num_cols[0]) + F.lit(1))
+    sample_df.write.format("delta").mode("append").saveAsTable(fqn)
+    print(f"  ✅ swapped 1 row (delete + mutated re-insert)")
+
+
 _DISPATCH = {
     "noop": mutation_noop,
     "delete_rows": mutation_delete_rows,
@@ -348,6 +539,9 @@ _DISPATCH = {
     "drop_column": mutation_drop_column,
     "null_out_pk": mutation_null_out_pk,
     "clear_key_cols": mutation_clear_key_cols,
+    "delete_rows_no_pk": mutation_delete_rows_no_pk,
+    "insert_extra_rows_no_pk": mutation_insert_extra_rows_no_pk,
+    "content_swap_no_pk": mutation_content_swap_no_pk,
 }
 
 if mutation_type not in _DISPATCH:

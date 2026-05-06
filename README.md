@@ -58,13 +58,22 @@ fabric-validation/
 
 ### Comparison modes
 
-| Mode | What it does | Cost | Catches |
-|---|---|---|---|
-| `basic` | Row counts only | Low | Counts diverging |
-| `hash` | Count + per-row MD5 of all comparable columns | Medium | Which rows differ (no column detail) |
-| `advanced` | Full column-by-column diff between matched rows | High | Which rows AND which columns differ |
+| Mode | What it does | Cost | Catches | Requires PK |
+|---|---|---|---|---|
+| `basic` | Row counts only | Low | Counts diverging | No |
+| `hash` | Count + per-row MD5 of all comparable columns | Medium | Which rows differ (no column detail) | **Yes** |
+| `hash_no_pk` | Multiset count diff over row hashes (full-outer join on `_row_hash`) | Medium | Net count drift + which row content "buckets" diverged | No |
+| `advanced` | Full column-by-column diff between matched rows | High | Which rows AND which columns differ | **Yes** |
+| `advanced_no_pk` | Bidirectional `exceptAll` over normalized rows | High–Very High | Full row content of every divergent row, both directions | No |
 
 `advanced` auto-falls-back to `hash` once row count exceeds `max_rows_advanced`.
+
+**Tables without a primary key.** Use `hash_no_pk` (cheap, multiset-aware) or
+`advanced_no_pk` (full row evidence, bidirectional). For tables already
+configured as `hash` or `advanced` whose `comparison_key_columns` is empty,
+set `pk_fallback_strategy` to `no_pk_hash` / `no_pk_advanced` and the engine
+will route automatically. See
+[how-to-guide.md §6.7 Validating tables without a primary key](how-to-guide.md#67-validating-tables-without-a-primary-key).
 
 ### Verdict types written to audit
 

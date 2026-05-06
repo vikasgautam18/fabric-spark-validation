@@ -30,8 +30,8 @@
                 }
             },
             {
-                "name": "ForEachScenario",
-                "description": "Run each scenario serially. Sequential execution avoids concurrent mutations on the same target_table that would cross-contaminate results.",
+                "name": "ForEachTargetGroup",
+                "description": "Outer ForEach: parallel fan-out across distinct target_table groups. Different tables have no shared lakehouse state, so their scenario sequences run concurrently. batchCount caps Spark/PG concurrency.",
                 "type": "ForEach",
                 "dependsOn": [
                     {
@@ -40,14 +40,15 @@
                     }
                 ],
                 "typeProperties": {
-                    "isSequential": true,
+                    "isSequential": false,
+                    "batchCount": 4,
                     "items": {
                         "value": "@json(activity('ListScenarios').output.result.exitValue)",
                         "type": "Expression"
                     },
                     "activities": [
                         {
-                            "name": "InvokeRunner",
+                            "name": "InvokeGroupRunner",
                             "type": "ExecutePipeline",
                             "dependsOn": [],
                             "policy": {
@@ -55,17 +56,17 @@
                             },
                             "typeProperties": {
                                 "pipeline": {
-                                    "referenceName": "__PIPELINE_ID__:validation_scenario_runner",
+                                    "referenceName": "__PIPELINE_ID__:validation_scenario_group_runner",
                                     "type": "PipelineReference"
                                 },
                                 "waitOnCompletion": true,
                                 "parameters": {
-                                    "scenario_id": {
-                                        "value": "@item().scenario_id",
-                                        "type": "Expression"
-                                    },
                                     "target_table": {
                                         "value": "@item().target_table",
+                                        "type": "Expression"
+                                    },
+                                    "scenarios": {
+                                        "value": "@item().scenarios",
                                         "type": "Expression"
                                     }
                                 }

@@ -202,7 +202,7 @@ Run `validation/core/comparison_setup.py` once to create them. It also seeds def
 | `pg_schema` | STRING | PG schema |
 | `pg_table_name` | STRING | PG table name (defaults to `table_name`) |
 | `lakehouse_schema` | STRING | Lakehouse schema (e.g. `silver`) |
-| `comparison_mode` | STRING | `basic` / `hash` / `advanced` |
+| `comparison_mode` | STRING | `basic` / `hash` / `hash_no_pk` / `advanced` / `advanced_no_pk` |
 | `filter_column` | STRING | Timestamp column for the lookback window. May be a SQL expression with `{window_start}` / `{window_end}` placeholders |
 | `filter_column_pg` | STRING | Override if PG column name differs (else uses `filter_column`) |
 | `filter_days` | INT | Window length in days |
@@ -212,14 +212,17 @@ Run `validation/core/comparison_setup.py` once to create them. It also seeds def
 | `max_rows_advanced` | INT | If `advanced` mode and row count exceeds this → fall back to `hash` |
 | `severity` | STRING | `critical` / `warning` / `info` (audit-only field) |
 | `enabled` | BOOLEAN | Engine skips disabled rows |
+| `pk_fallback_strategy` | STRING | `fail` (default — strict; raise on empty `comparison_key_columns`) / `no_pk_hash` / `no_pk_advanced`. Lets `hash` / `advanced` modes route to their PK-less variants instead of erroring out. See §6.7 |
 
 ### 6.2 Choosing a mode
 
-| Use mode | When |
-|---|---|
-| `basic` | Smoke tests; tables where row count alone is enough; very large fact tables where per-row hashing is too expensive |
-| `hash` | Default for medium/large tables. Detects "rows differ" without expensive column-level work |
-| `advanced` | Small reference tables, dimension tables, anywhere you need to know **which column** changed |
+| Use mode | When | PK required |
+|---|---|---|
+| `basic` | Smoke tests; tables where row count alone is enough; very large fact tables where per-row hashing is too expensive | No |
+| `hash` | Default for medium/large tables. Detects "rows differ" without expensive column-level work | **Yes** |
+| `hash_no_pk` | Same as `hash` but for tables without a PK. Multiset-aware (preserves duplicate counts). Cannot tell *which row* changed when totals match — emits `inconclusive` in that case | No |
+| `advanced` | Small reference tables, dimension tables, anywhere you need to know **which column** changed | **Yes** |
+| `advanced_no_pk` | PK-less tables where you need full row-content evidence on both sides. Most expensive option (`exceptAll` shuffles full row payloads) | No |
 
 ### 6.3 Choosing a `schema_drift_policy`
 
@@ -269,6 +272,83 @@ Placeholders `{window_start}` / `{window_end}` are interpolated by the engine on
 
 > **Security note:** filter expressions are interpolated into SQL **without validation**. Treat `comparison_config` as trusted code.
 
+### 6.7 Validating tables without a primary key
+
+Some source tables (event logs, sensor streams, append-only landing tables)
+have no natural primary key — duplicates are part of the data. The engine
+supports two PK-less modes plus an opt-in fallback for tables already
+configured as `hash` / `advanced`.
+
+#### 6.7.1 The two PK-less modes
+
+| Mode | How it works | Catches | When totals match but content diverges |
+|---|---|---|---|
+| `hash_no_pk` | `groupBy(_row_hash).count()` on each side, full-outer join on hash | Net count drift, multiset divergence | Reports `inconclusive` (cannot pair rows without PK) |
+| `advanced_no_pk` | Project both sides through the same type-normalization, then bidirectional `exceptAll` (multiplicity preserved) | Full row content of every divergent row, both directions | Reports `hash_mismatch` with samples on **both** sides |
+
+Pick `hash_no_pk` for cheap detection of net drift on large PK-less tables.
+Pick `advanced_no_pk` when you need full row evidence and the table is small
+enough that an `exceptAll` shuffle is acceptable.
+
+#### 6.7.2 Configuring a PK-less table
+
+```sql
+INSERT INTO validation.comparison_config VALUES
+  ('event_log', 'healthcare', 'event_log', 'silver',
+   'hash_no_pk', 'event_ts', NULL, 7, 30, 'fail',
+   0.0, 500000, 'warning', true,
+   NULL);  -- pk_fallback_strategy not used when mode is already *_no_pk
+```
+
+Do **not** insert into `comparison_key_columns` — it must remain empty for
+PK-less modes.
+
+#### 6.7.3 Auto-routing via `pk_fallback_strategy`
+
+If a table is configured as `hash` or `advanced` but has no rows in
+`comparison_key_columns`, the engine consults `pk_fallback_strategy`:
+
+| `pk_fallback_strategy` value | Behaviour for `mode='hash'` | Behaviour for `mode='advanced'` |
+|---|---|---|
+| `NULL` or `fail` (default) | Audit `error` with actionable message — no run | Audit `error` with actionable message — no run |
+| `no_pk_hash` | Routes to `run_hash_no_pk`; `comparison_results.actual_mode` records `hash_no_pk` | Routes to `run_hash_no_pk` |
+| `no_pk_advanced` | Routes to `run_advanced_no_pk` | Routes to `run_advanced_no_pk`; `actual_mode` records `advanced_no_pk` |
+
+This lets you opt into PK-less handling per table without changing the
+declared `comparison_mode` — useful when most of a workload is hash/advanced
+but a few tables can't supply a PK. To enable it on an existing row:
+
+```sql
+ALTER TABLE validation.comparison_config
+  ADD COLUMNS (pk_fallback_strategy STRING);  -- only on pre-Phase-5 deployments
+UPDATE validation.comparison_config
+   SET enabled = true, pk_fallback_strategy = 'no_pk_hash'
+ WHERE table_name = 'event_log';
+```
+
+The `comparison_setup` notebook does this idempotently for the bundled
+PK-less fixtures (`event_log`, `sensor_readings`, `landing_orders`).
+
+#### 6.7.4 Caveats (why a PK is still preferable when you have one)
+
+- **No row-level pairing.** Without a PK the engine cannot say "row X
+  changed column Y from A to B"; it can only say "this row content is in
+  one side and not the other".
+- **`numeric_tolerance` is approximate in `advanced_no_pk`.** It is applied
+  by rounding numeric columns to `ceil(-log10(tolerance))` decimal places
+  before the set difference, so values straddling a rounding boundary may
+  register as different even when `|lh-pg| < tolerance`. For exact per-row
+  tolerance use `advanced` mode.
+- **`numeric_tolerance` is NOT applied at all in `hash_no_pk`** — hashes are
+  byte-exact. Floats are normalized to 8 decimal places (matching `hash`),
+  JSON/JSONB compared as text, timestamps at second precision.
+- **`hash_no_pk` returns `inconclusive` on a content swap** (delete N + insert N
+  different rows): totals match but the multiset diverges and there is no
+  way to pair the missing/extra rows.
+- **`exceptAll` shuffles full row payloads.** Wide tables with millions of
+  rows are dramatically more expensive in `advanced_no_pk` than in
+  `hash_no_pk`. Profile before enabling.
+
 ---
 
 ## 7. Run the comparison engine
@@ -298,7 +378,7 @@ Compares **every enabled row** in `comparison_config`. Writes one row per table 
 | `hash_mismatch` | Counts equal but row hashes differ (`hash`/`advanced` modes) |
 | `column_mismatch` | At least one column-level diff (`advanced` mode) |
 | `schema_drift` | Schema drift detected and `policy=fail` |
-| `inconclusive` | Mode/checks couldn't run (missing PK, all-null filter column, etc.) |
+| `inconclusive` | Mode/checks couldn't run (missing PK, all-null filter column, etc.) — also emitted by `hash_no_pk` when totals match but the multiset diverges (content swap with no PK to pair on) |
 | `error` | Unhandled exception — see `error_message` |
 
 `hash` mode short-circuits when counts differ → returns `count_mismatch` immediately (no expensive hash compare).
@@ -367,9 +447,10 @@ Scenarios live in `validation.scenarios`. Each row defines:
 |---|---|
 | `scenario_id` | Unique name |
 | `target_table` | Which table to mutate (must exist in `comparison_config`) |
-| `mutation_type` | `noop` / `delete_rows` / `insert_extra_rows` / `update_column` / `add_extra_column` |
-| `mutation_params` | JSON with mutation-specific knobs (e.g. `{"n": 50}`) |
-| `expected_verdict` | What the engine should return |
+| `mutation_type` | `noop` / `delete_rows` / `insert_extra_rows` / `update_column` / `add_extra_column` / `drop_column` / `null_out_pk` / `clear_key_cols` / `delete_rows_no_pk` / `insert_extra_rows_no_pk` / `content_swap_no_pk` |
+| `mutation_params` | JSON with mutation-specific knobs (e.g. `{"count": 50}`; for `insert_extra_rows_no_pk` the `mutate` flag toggles unique-vs-verbatim duplicate) |
+| `expected_status` | What the engine should return (e.g. `pass`, `count_mismatch`, `hash_mismatch`, `inconclusive`, `error`, `schema_drift`) |
+| `valid_comparison_modes` | Comma-separated list, e.g. `hash_no_pk,advanced_no_pk`. Scenarios are skipped (`not_applicable`) when the table's active mode is not listed |
 | `enabled` | Toggle |
 
 ### 10.3 Manual run (single scenario)
@@ -387,18 +468,22 @@ validation/engine_tests/scenario_assert.py         (with scenario_id parameter)
 Deploy and trigger the parent pipeline:
 
 ```bash
-python3 scripts/deploy_pipeline.py validation/engine_tests/pipelines/validation_scenario_runner.json validation_scenario_runner
-python3 scripts/deploy_pipeline.py validation/engine_tests/pipelines/validation_test_suite.json     validation_test_suite
+python3 scripts/deploy_pipeline.py validation/engine_tests/pipelines/validation_scenario_runner.json       validation_scenario_runner
+python3 scripts/deploy_pipeline.py validation/engine_tests/pipelines/validation_scenario_group_runner.json validation_scenario_group_runner
+python3 scripts/deploy_pipeline.py validation/engine_tests/pipelines/validation_test_suite.json           validation_test_suite
 ```
 
 Trigger `validation_test_suite` from the Fabric portal. It:
 
-1. Calls `scenario_list` to enumerate enabled scenarios as JSON.
-2. ForEach (sequential) over each scenario → invokes `validation_scenario_runner`:
+1. Calls `scenario_list` to enumerate enabled scenarios, **grouped by `target_table`**.
+2. ForEach (**parallel**, `batchCount=4`) over the groups → invokes `validation_scenario_group_runner` per group.
+3. Inside each group, ForEach (sequential) over the scenarios → invokes `validation_scenario_runner`:
    - **RestoreBaseline** — re-imports the target table from PG (clean slate)
    - **RunSeeder** — applies the mutation
    - **RunEngine** — runs comparison_engine with `tables_filter=[target_table]`, `fail_on_validation_failure=False`
    - **RunAssert** — reads the audit row and verifies actual verdict matches expected
+
+Two scenarios on the **same** `target_table` always run sequentially (mutations would cross-contaminate). Scenarios on **different** tables run concurrently.
 
 A scenario passes when `actual_verdict == expected_verdict`.
 
