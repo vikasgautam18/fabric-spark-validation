@@ -2,10 +2,11 @@
 # coding: utf-8
 
 # # scenario_list
-# Reads `validation.scenarios` and emits a JSON array of enabled scenarios
-# (scenario_id, target_table) so the parent pipeline can ForEach over them.
-# Kept tiny on purpose: pipelines need a structured "items" payload and a
-# Lookup activity over a Lakehouse Delta table is awkward to maintain.
+# Reads `validation.scenarios` and emits a JSON array of GROUPS:
+#   [ {target_table: "...", scenarios: [{scenario_id, target_table}, ...]}, ... ]
+# This shape lets the parent pipeline run a parallel outer ForEach over
+# distinct target_tables while keeping per-table scenario execution sequential
+# (mutations on the same table would otherwise cross-contaminate).
 
 # In[1]:
 
@@ -35,10 +36,29 @@ rows = spark.sql(f"""
     ORDER BY target_table, scenario_id
 """).collect()
 
-items = [{"scenario_id": r["scenario_id"], "target_table": r["target_table"]} for r in rows]
+# Group by target_table so the parent pipeline can fan out parallel ForEach
+# *across* tables while keeping inner ForEach sequential *within* a table.
+# Two scenarios that mutate the same lakehouse table cannot run concurrently
+# (they would cross-contaminate before the engine sees the drift), but
+# scenarios on disjoint tables are independent.
+groups = {}
+for r in rows:
+    tt = r["target_table"]
+    groups.setdefault(tt, []).append({
+        "scenario_id": r["scenario_id"],
+        "target_table": tt,
+    })
+
+items = [
+    {"target_table": tt, "scenarios": scns}
+    for tt, scns in sorted(groups.items())
+]
 payload = json.dumps(items)
-print(f"Found {len(items)} enabled scenario(s)")
-for it in items:
-    print(f"  • {it['scenario_id']:<40s} → {it['target_table']}")
+print(f"Found {sum(len(g['scenarios']) for g in items)} enabled scenario(s) "
+      f"across {len(items)} target_table group(s):")
+for g in items:
+    print(f"  • {g['target_table']:<28s} ({len(g['scenarios'])} scenario(s))")
+    for s in g["scenarios"]:
+        print(f"      - {s['scenario_id']}")
 
 notebookutils.notebook.exit(payload)

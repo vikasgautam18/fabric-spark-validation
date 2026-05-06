@@ -1,0 +1,59 @@
+{
+    "name": "validation_scenario_group_runner",
+    "objectId": "00000000-0000-0000-0000-000000000000",
+    "properties": {
+        "description": "Sequentially runs every scenario for a single target_table. Invoked once per target_table by validation_test_suite's parallel outer ForEach. Within one target_table, scenarios MUST run sequentially because each mutates the same lakehouse copy and the next scenario re-imports the baseline before its own mutation.",
+        "activities": [
+            {
+                "name": "ForEachScenarioInGroup",
+                "type": "ForEach",
+                "dependsOn": [],
+                "typeProperties": {
+                    "isSequential": true,
+                    "items": {
+                        "value": "@pipeline().parameters.scenarios",
+                        "type": "Expression"
+                    },
+                    "activities": [
+                        {
+                            "name": "InvokeRunner",
+                            "type": "ExecutePipeline",
+                            "dependsOn": [],
+                            "policy": {
+                                "secureInput": false
+                            },
+                            "typeProperties": {
+                                "pipeline": {
+                                    "referenceName": "__PIPELINE_ID__:validation_scenario_runner",
+                                    "type": "PipelineReference"
+                                },
+                                "waitOnCompletion": true,
+                                "parameters": {
+                                    "scenario_id": {
+                                        "value": "@item().scenario_id",
+                                        "type": "Expression"
+                                    },
+                                    "target_table": {
+                                        "value": "@item().target_table",
+                                        "type": "Expression"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "parameters": {
+            "target_table": {
+                "type": "string",
+                "defaultValue": ""
+            },
+            "scenarios": {
+                "type": "array",
+                "defaultValue": []
+            }
+        },
+        "annotations": [ "validation", "scenario-suite" ]
+    }
+}

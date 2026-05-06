@@ -324,6 +324,75 @@ elif mutation_type == "clear_key_cols":
             f"'{needle}' (got: {err[:200]!r})"
         )
 
+elif mutation_type == "delete_rows_no_pk":
+    n = int(mutation_params.get("count", 1))
+    if pg_c is None or lh_c is None:
+        evidence_ok = False
+        evidence_notes.append("counts missing")
+    else:
+        delta = pg_c - lh_c
+        if delta < 1:
+            evidence_ok = False
+            evidence_notes.append(f"expected pg>lh after delete_rows_no_pk; got pg={pg_c} lh={lh_c}")
+        elif abs(delta - n) > max(2, n * 0.5):
+            # No-PK row-equality DELETE may match more than `n` if exact dups
+            # exist; allow generous tolerance.
+            evidence_notes.append(f"delta {delta} differs from requested {n}")
+    sm = _need_samples()
+    # hash_no_pk → only_in_postgres_multiset; advanced_no_pk → only_in_postgres_no_pk
+    if sm and not any(
+        s["mismatch_type"] in ("only_in_postgres_multiset", "only_in_postgres_no_pk", "multiset_count_diff")
+        for s in sm
+    ):
+        evidence_notes.append("no postgres-side no_pk samples captured")
+
+elif mutation_type == "insert_extra_rows_no_pk":
+    n = int(mutation_params.get("count", 1))
+    mutate = bool(mutation_params.get("mutate", False))
+    if pg_c is None or lh_c is None:
+        evidence_ok = False
+        evidence_notes.append("counts missing")
+    else:
+        delta = lh_c - pg_c
+        if delta < 1:
+            evidence_ok = False
+            evidence_notes.append(f"expected lh>pg after insert_extra_rows_no_pk; got pg={pg_c} lh={lh_c}")
+    sm = _need_samples()
+    if mutate:
+        # Mutated row → unique → only_in_lakehouse_multiset (hash_no_pk)
+        # or only_in_lakehouse_no_pk (advanced_no_pk)
+        if sm and not any(
+            s["mismatch_type"] in ("only_in_lakehouse_multiset", "only_in_lakehouse_no_pk")
+            for s in sm
+        ):
+            evidence_notes.append("no only_in_lakehouse no_pk samples captured")
+    else:
+        # Verbatim duplicate → hash bucket already exists → multiset_count_diff
+        # (only meaningful for hash_no_pk; advanced_no_pk surfaces it as
+        # only_in_lakehouse_no_pk via exceptAll-with-multiplicity)
+        if sm and not any(
+            s["mismatch_type"] in ("multiset_count_diff", "only_in_lakehouse_no_pk")
+            for s in sm
+        ):
+            evidence_notes.append("no multiset_count_diff or only_in_lakehouse_no_pk samples captured")
+
+elif mutation_type == "content_swap_no_pk":
+    # Counts MUST match (delete 1 + insert 1)
+    if pg_c is None or lh_c is None:
+        evidence_ok = False
+        evidence_notes.append("counts missing")
+    elif pg_c != lh_c:
+        evidence_ok = False
+        evidence_notes.append(f"content_swap_no_pk should preserve count; got pg={pg_c} lh={lh_c}")
+    sm = _need_samples()
+    # Both directions should be visible in samples (one only_in_lh, one only_in_pg).
+    has_lh = any(s["mismatch_type"] in ("only_in_lakehouse_multiset", "only_in_lakehouse_no_pk") for s in sm)
+    has_pg = any(s["mismatch_type"] in ("only_in_postgres_multiset", "only_in_postgres_no_pk") for s in sm)
+    if sm and not (has_lh and has_pg):
+        evidence_notes.append(
+            f"content_swap_no_pk expects both lh and pg samples; lh={has_lh} pg={has_pg}"
+        )
+
 
 # In[8]:
 

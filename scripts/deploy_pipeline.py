@@ -26,7 +26,7 @@ takes precedence over auto-resolution. May be repeated.
 """
 import os, re, sys, json, base64, subprocess, time, urllib.request, urllib.error
 
-DEFAULT_WORKSPACE_ID = "5597b17a-edef-4fd7-bcc4-3dbd5b139576"
+DEFAULT_WORKSPACE_ID = "e692fb91-ab30-4b11-a11a-22da087d11d7"
 FABRIC_AUD           = "https://api.fabric.microsoft.com"
 
 # Map placeholder prefix → REST item-type filter used to list items.
